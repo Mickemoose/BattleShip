@@ -253,6 +253,54 @@ file(GLOB_RECURSE SSB64_SRC_SC      "decomp/src/sc/*.c"      "decomp/src/sc/*.h"
 file(GLOB_RECURSE SSB64_SRC_SYS     "decomp/src/sys/*.c"     "decomp/src/sys/*.h")
 file(GLOB_RECURSE SSB64_SRC_WP      "decomp/src/wp/*.c"      "decomp/src/wp/*.h")
 
+# ── CSS icon pipeline (from upstream main) ────────────────────────────────
+# Stage-specific assets (background wallpapers + CSS thumbnails) are
+# extracted from the baserom at build time by tools/derive_stage_assets.py
+# and loaded at runtime as PNG files. The scroll arrow is original port
+# artwork baked into the binary via tools/png_to_c_array.py.
+set(SSB64_CSS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(SSB64_CSS_STAGE_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/assets/css_icons)
+set(SSB64_CSS_FD_BG_PNG      ${SSB64_CSS_STAGE_ASSET_DIR}/final_destination_background.png)
+set(SSB64_CSS_FD_SMALL_PNG   ${SSB64_CSS_STAGE_ASSET_DIR}/final_destination_small.png)
+set(SSB64_CSS_FD_NAME_PNG    ${SSB64_CSS_STAGE_ASSET_DIR}/final_destination_name.png)
+set(SSB64_CSS_FD_EMBLEM_PNG  ${SSB64_CSS_STAGE_ASSET_DIR}/final_destination_emblem.png)
+set(SSB64_CSS_MC_BG_PNG      ${SSB64_CSS_STAGE_ASSET_DIR}/metal_cavern_background.png)
+set(SSB64_CSS_MC_SMALL_PNG   ${SSB64_CSS_STAGE_ASSET_DIR}/metal_cavern_small.png)
+set(SSB64_CSS_MC_NAME_PNG    ${SSB64_CSS_STAGE_ASSET_DIR}/metal_cavern_name.png)
+set(SSB64_CSS_BF_BG_PNG      ${SSB64_CSS_STAGE_ASSET_DIR}/battlefield_background.png)
+set(SSB64_CSS_BF_SMALL_PNG   ${SSB64_CSS_STAGE_ASSET_DIR}/battlefield_small.png)
+set(SSB64_CSS_BF_NAME_PNG    ${SSB64_CSS_STAGE_ASSET_DIR}/battlefield_name.png)
+set(SSB64_CSS_ARROW_PNG       ${CMAKE_CURRENT_SOURCE_DIR}/port/assets/css_icons/arrow.png)
+set(SSB64_CSS_ARROW_LEFT_PNG  ${CMAKE_CURRENT_SOURCE_DIR}/port/assets/css_icons/arrow_left.png)
+set(SSB64_CSS_ARROW_H         ${SSB64_CSS_GEN_DIR}/arrow_data.h)
+set(SSB64_CSS_ARROW_LEFT_H    ${SSB64_CSS_GEN_DIR}/arrow_left_data.h)
+add_custom_command(
+    OUTPUT ${SSB64_CSS_ARROW_H}
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+            ${SSB64_CSS_ARROW_PNG}
+            ${SSB64_CSS_ARROW_H}
+            arrow
+    DEPENDS
+        ${SSB64_CSS_ARROW_PNG}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+    COMMENT "Baking scroll-arrow -> ${SSB64_CSS_ARROW_H}"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${SSB64_CSS_ARROW_LEFT_H}
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+            ${SSB64_CSS_ARROW_LEFT_PNG}
+            ${SSB64_CSS_ARROW_LEFT_H}
+            arrowLeft
+    DEPENDS
+        ${SSB64_CSS_ARROW_LEFT_PNG}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+    COMMENT "Baking scroll-arrow (left) -> ${SSB64_CSS_ARROW_LEFT_H}"
+    VERBATIM
+)
+
 # Port layer (C++ glue) — excludes port/stubs/ which is compiled as part of ssb64_game
 file(GLOB_RECURSE SSB64_SRC_PORT "port/*.cpp" "port/*.c" "port/*.h")
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/stubs/")
@@ -261,6 +309,13 @@ list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/stubs/")
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/resource/RelocFileTable\\.(us|jp)\\.cpp$")
 list(APPEND SSB64_SRC_PORT
     ${CMAKE_CURRENT_SOURCE_DIR}/port/resource/RelocFileTable.${SSB64_VERSION}.cpp)
+# Arrow baked headers — added as sources so CMake schedules their generation
+# before any port TU compilation. Stage background/icon PNGs are disk-loaded
+# at runtime; no baked headers for those.
+list(APPEND SSB64_SRC_PORT
+    ${SSB64_CSS_ARROW_H}
+    ${SSB64_CSS_ARROW_LEFT_H}
+)
 
 # Debug tools (GBI trace + Acmd trace systems)
 file(GLOB SSB64_DEBUG_TOOLS
@@ -416,6 +471,10 @@ target_include_directories(ssb64_game PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/decomp/src       # Decomp game module headers
     ${CMAKE_CURRENT_SOURCE_DIR}/port             # Port headers (coroutine.h, etc.)
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_tools      # Acmd trace (mixer.h calls acmd_trace_log_cmd)
+    # Event system headers: decomp PORT hooks fire engine events directly
+    # (hooks/Events.h -> ship/events/EventTypes.h + bridge/eventsbridge.h).
+    ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/include
 )
 
 # Clang 16+ promoted several historically-warning diagnostics to errors by
@@ -492,6 +551,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/decomp/src       # Decomp game module headers (sys/, ft/, sc/, ...)
     ${CMAKE_CURRENT_SOURCE_DIR}/port
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_tools
+    ${SSB64_CSS_GEN_DIR}                         # CSS icon baked headers (arrow_data.h)
 )
 
 ################################################################################
@@ -801,10 +861,6 @@ if(EXISTS "${SSB64_BASEROM}")
         DEPENDS TorchExternal PrepareBuildInputs GenerateF3DO2R ${SSB64_BASEROM}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SSB64_O2R_DIR}
         COMMAND ${TORCH_EXECUTABLE} o2r ${SSB64_BASEROM} -s ${CMAKE_SOURCE_DIR} -d ${SSB64_O2R_DIR}
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${PROJECT_NAME}>
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${SSB64_O2R}
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>/BattleShip.o2r
         COMMENT "Extracting ${SSB64_VERSION} assets from ${SSB64_BASEROM} -> ${SSB64_O2R}"
     )
     add_custom_target(ExtractAssets DEPENDS ${SSB64_O2R})
@@ -816,6 +872,96 @@ if(EXISTS "${SSB64_BASEROM}")
     # The release pipeline ships no baserom and hits the else() branch,
     # so packaged builds are unaffected (runtime first-run extracts).
     add_dependencies(${PROJECT_NAME} ExtractAssets)
+    # Staging next to the binary happens POST_BUILD: a
+    # $<TARGET_FILE_DIR:...> genex inside the OUTPUT custom command above
+    # would imply a target-level dependency on ${PROJECT_NAME}, which
+    # cycles with the add_dependencies() just declared (hard error on the
+    # Visual Studio generator).
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_O2R}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/BattleShip.o2r
+        COMMENT "Staging BattleShip.o2r next to the binary"
+    )
+
+    # ── CSS stage asset extraction (from upstream main) ────────────────────
+    # derive_stage_assets.py extracts the FD/Metal Cavern/Battlefield
+    # background + icon PNGs from the ROM and synthesizes the nameplate PNGs.
+    # Copied to the run directory so the game loads them at runtime; no
+    # Nintendo-derived bytes are baked into the binary.
+    add_custom_command(
+        OUTPUT
+            ${SSB64_CSS_FD_BG_PNG}
+            ${SSB64_CSS_FD_SMALL_PNG}
+            ${SSB64_CSS_FD_NAME_PNG}
+            ${SSB64_CSS_FD_EMBLEM_PNG}
+            ${SSB64_CSS_MC_BG_PNG}
+            ${SSB64_CSS_MC_SMALL_PNG}
+            ${SSB64_CSS_MC_NAME_PNG}
+            ${SSB64_CSS_BF_BG_PNG}
+            ${SSB64_CSS_BF_SMALL_PNG}
+            ${SSB64_CSS_BF_NAME_PNG}
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/derive_stage_assets.py
+                ${SSB64_BASEROM}
+                ${SSB64_CSS_STAGE_ASSET_DIR}
+        DEPENDS
+            ${SSB64_BASEROM}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/derive_stage_assets.py
+        COMMENT "Extracting CSS stage assets from ${SSB64_BASEROM}"
+        VERBATIM
+    )
+    add_custom_target(DeriveStageAssets
+        DEPENDS
+            ${SSB64_CSS_FD_BG_PNG}
+            ${SSB64_CSS_FD_SMALL_PNG}
+            ${SSB64_CSS_FD_NAME_PNG}
+            ${SSB64_CSS_FD_EMBLEM_PNG}
+            ${SSB64_CSS_MC_BG_PNG}
+            ${SSB64_CSS_MC_SMALL_PNG}
+            ${SSB64_CSS_MC_NAME_PNG}
+            ${SSB64_CSS_BF_BG_PNG}
+            ${SSB64_CSS_BF_SMALL_PNG}
+            ${SSB64_CSS_BF_NAME_PNG}
+    )
+    add_dependencies(${PROJECT_NAME} DeriveStageAssets)
+    # Copy extracted PNGs into the run-directory asset subtree so the game
+    # can find them at  <run-dir>/assets/css_icons/<name>_*.png .
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_FD_BG_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/final_destination_background.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_FD_SMALL_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/final_destination_small.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_FD_NAME_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/final_destination_name.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_FD_EMBLEM_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/final_destination_emblem.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_MC_BG_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/metal_cavern_background.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_MC_SMALL_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/metal_cavern_small.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_MC_NAME_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/metal_cavern_name.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_BF_BG_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/battlefield_background.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_BF_SMALL_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/battlefield_small.png
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${SSB64_CSS_BF_NAME_PNG}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets/css_icons/battlefield_name.png
+        COMMENT "Staging CSS stage asset PNGs next to ssb64 binary"
+    )
 else()
     add_custom_target(ExtractAssets
         COMMAND ${CMAKE_COMMAND} -E echo

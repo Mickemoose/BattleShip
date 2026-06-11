@@ -1,12 +1,12 @@
 [submodule "libultraship"]
 	path = libultraship
-	url = https://github.com/JRickey/libultraship.git
-	branch = ssb64
+	url = ../libultraship.git
+	branch = code-mod-support
 [submodule "torch"]
 	path = torch
 	url = https://github.com/JRickey/Torch.git
 	branch = ssb64
 [submodule "decomp"]
 	path = decomp
-	url = https://github.com/JRickey/ssb-decomp-re.git
-	branch = port-patches
+	url = ../ssb-decomp-re.git
+	branch = code-mod-support
