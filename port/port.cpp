@@ -47,6 +47,7 @@
 #endif
 #include "renderdoc_trigger.h"
 #include "port_log.h"
+#include "fighter_registry.h"
 
 #ifndef DISABLE_SCRIPTING
 #include <ship/scripting/ScriptLoader.h>
@@ -92,6 +93,20 @@ extern "C" struct MPGroundData *gMPCollisionGroundData_Ref(void) {
     return gMPCollisionGroundData;
 }
 extern "C" void* sModBridgeAnchorGroundDataRef = (void*)&gMPCollisionGroundData_Ref;
+
+/* Fighter data-files lookup table. Exposed so mod-loader code can
+ * write a registered character's FTData* into the trailing NULL-sentinel
+ * slot (index nFTKindEnumCount) during ftManagerMakeFighter and have
+ * the engine's internal `fp->data = dFTManagerDataFiles[fp->fkind]`
+ * indexing resolve to that entry. Same export-hole workaround as the
+ * other globals. */
+struct FTData;
+extern "C" struct FTData **dFTManagerDataFiles_Ref(void);
+extern "C" struct FTData **dFTManagerDataFiles_Ref(void) {
+    extern struct FTData *dFTManagerDataFiles[];
+    return dFTManagerDataFiles;
+}
+extern "C" void* sModBridgeAnchorDataFilesRef = (void*)&dFTManagerDataFiles_Ref;
 #endif
 
 #include <filesystem>
@@ -117,6 +132,10 @@ static void portCrtInvalidParameter(const wchar_t* expr, const wchar_t* func,
 	port_log_close();
 }
 
+static volatile LONG sMinidumpWritten = 0;
+static void portResolveSymbol(void* addr, char* out, size_t cap);
+static void portWriteMinidump(EXCEPTION_POINTERS* info, const char* prefix);
+
 static void portTerminateHandler()
 {
 	port_log("\n*** std::terminate called (uncaught C++ exception) ***\n");
@@ -135,11 +154,28 @@ static void portSignalHandler(int sig)
 		case SIGSEGV: name = "SIGSEGV"; break;
 		case SIGTERM: name = "SIGTERM"; break;
 	}
-	port_log("\n*** SIGNAL %s (%d) raised ***\n", name, sig);
+	port_log("\n*** SIGNAL %s (%d) raised - tid=%lu ***\n",
+	         name, sig, (unsigned long)GetCurrentThreadId());
+
+	/* signal() handlers get no EXCEPTION_POINTERS and abort() does not run the
+	 * SEH crash filter, so without this the abort path leaves no stack in the
+	 * log (and writes no dump). Capture + symbolize it here so a re-crash
+	 * self-reports the faulting frames. An uncaught C++ exception routes here
+	 * too (terminate -> abort -> SIGABRT), so the throw site is still on the
+	 * stack below. */
+	void* frames[48];
+	WORD nframes = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+	for (WORD i = 0; i < nframes; i++) {
+		char fsym[768] = {0};
+		portResolveSymbol(frames[i], fsym, sizeof(fsym));
+		port_log("    [%2u] %p %s\n", i, frames[i], fsym[0] ? fsym : "(no sym)");
+	}
+
+	if (InterlockedCompareExchange(&sMinidumpWritten, 1, 0) == 0) {
+		portWriteMinidump(nullptr, "signal");
+	}
 	port_log_close();
 }
-
-static volatile LONG sMinidumpWritten = 0;
 
 static void portResolveSymbol(void* addr, char* out, size_t cap)
 {
@@ -195,7 +231,7 @@ static void portWriteMinidump(EXCEPTION_POINTERS* info, const char* prefix)
 	MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hf,
 	                  (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
 	                                  MiniDumpWithIndirectlyReferencedMemory),
-	                  &mei, nullptr, nullptr);
+	                  info ? &mei : nullptr, nullptr, nullptr);
 	CloseHandle(hf);
 	port_log("    %s minidump = %s\n", prefix, dumpPath);
 }
@@ -975,6 +1011,14 @@ static int PortInitImpl(int argc, char* argv[]) {
 		port_log("SSB64: HookManager::Init failed - mods will not load\n");
 	}
 #endif
+
+	/* Seed the per-fkind dispatch registry from the vanilla decomp arrays
+	 * BEFORE any mod runs. Mods can overwrite vanilla rows or add synth
+	 * rows past nFTKindEnumCount via port_fighter_register at MOD_INIT;
+	 * the engine reads through registry accessors instead of fixed-size
+	 * vanilla arrays, so synth fkinds never OOB those tables. */
+	port_fighter_seed_vanilla();
+	port_log("SSB64: fighter registry seeded\n");
 
 #ifndef DISABLE_SCRIPTING
 	/* Mount mods/ entries (folders, .o2r, .zip) into the LUS
