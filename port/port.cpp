@@ -48,6 +48,7 @@
 #include "renderdoc_trigger.h"
 #include "port_log.h"
 #include "fighter_registry.h"
+#include "stage_registry.h"
 
 #ifndef DISABLE_SCRIPTING
 #include <ship/scripting/ScriptLoader.h>
@@ -67,6 +68,28 @@ extern "C" void* mod_resolve_symbol(const char* symbol_name);
 extern "C" void* sScriptingBridgeAnchor = (void*)&ScriptGetFunction;
 extern "C" void* sModBridgeAnchorHook    = (void*)&mod_install_hook;
 extern "C" void* sModBridgeAnchorResolve = (void*)&mod_resolve_symbol;
+
+/* Generic mods-folder bridge. A sandboxed mod can't resolve the bundle path or
+ * enumerate the filesystem; these expose the absolute mods root, a single-level
+ * directory listing, and a file read. Folder conventions stay in the mod.
+ * Defined at global scope below; anchored here so they export for tcc -impdef. */
+extern "C" int  port_mods_root(char* out, int out_cap);
+extern "C" int  port_list_dir(const char* abs_dir);
+extern "C" int  port_list_entry(int idx, char* name_out, int name_cap, int* is_dir);
+extern "C" long port_ce_read_mod_file(const char* abs_path, void* dst, long dst_cap);
+extern "C" void* sModsBridgeAnchor1 = (void*)&port_mods_root;
+extern "C" void* sModsBridgeAnchor2 = (void*)&port_list_dir;
+extern "C" void* sModsBridgeAnchor3 = (void*)&port_list_entry;
+extern "C" void* sModsBridgeAnchor4 = (void*)&port_ce_read_mod_file;
+
+/* Costume stock-icon clamp (Phase 3). The character mod registers a resolver
+ * that maps an extra abs_index costume back to a valid stock-LUT slot; decomp
+ * stock reads route through port_fighter_costume_stock_index. Anchored to
+ * export. */
+extern "C" void port_register_costume_stock_resolver(int (*fn)(int,int));
+extern "C" int  port_fighter_costume_stock_index(int fkind, int costume);
+extern "C" void* sCeCostumeAnchor4 = (void*)&port_register_costume_stock_resolver;
+extern "C" void* sCeCostumeAnchor5 = (void*)&port_fighter_costume_stock_index;
 
 /* MSVC's WINDOWS_EXPORT_ALL_SYMBOLS pass exports global *functions* but
  * not most non-trivial global *data* objects, so engine globals like
@@ -107,10 +130,20 @@ extern "C" struct FTData **dFTManagerDataFiles_Ref(void) {
     return dFTManagerDataFiles;
 }
 extern "C" void* sModBridgeAnchorDataFilesRef = (void*)&dFTManagerDataFiles_Ref;
+
+/* NOTE: the per-synth special-status resolver slot
+ * (port_register_special_status_resolver / port_resolve_special_status_descs)
+ * was removed: nothing engine-side ever called the resolve function —
+ * ftMainSetStatus reads synth special descs straight from the fighter
+ * registry rows via port_fighter_special_descs(), which the character mod
+ * populates at registration time. */
 #endif
 
 #include <filesystem>
 #include <system_error>
+#include <fstream>
+#include <algorithm>
+#include <cstdint>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -174,6 +207,7 @@ static void portSignalHandler(int sig)
 	if (InterlockedCompareExchange(&sMinidumpWritten, 1, 0) == 0) {
 		portWriteMinidump(nullptr, "signal");
 	}
+
 	port_log_close();
 }
 
@@ -506,6 +540,99 @@ void MountModsDir() {
 }
 
 } // namespace ssb64
+
+/* ---- Generic mods-folder access -----------------------------------------
+ * port_mods_root: absolute <bundle>/mods path (the one host-only fact).
+ * port_list_dir / port_list_entry: single-level directory listing, single-
+ * buffered -- read all entries of one dir before listing another. */
+extern "C" int port_mods_root(char* out, int out_cap) {
+	const std::string s = ssb64::RealAppBundlePath() + "/mods";
+	if (!out || out_cap <= (int)s.size()) {
+		return -1;
+	}
+	std::memcpy(out, s.c_str(), s.size());
+	out[s.size()] = '\0';
+	return (int)s.size();
+}
+
+namespace { struct CeDirEntry { std::string name; int is_dir; }; }
+static std::vector<CeDirEntry> sCeDirEntries;
+
+extern "C" int port_list_dir(const char* abs_dir) {
+	namespace fs = std::filesystem;
+	sCeDirEntries.clear();
+	if (!abs_dir) {
+		return -1;
+	}
+	std::error_code ec;
+	const fs::path d(abs_dir);
+	if (!fs::is_directory(d, ec)) {
+		return -1;
+	}
+	fs::directory_iterator it(d, fs::directory_options::skip_permission_denied, ec);
+	const fs::directory_iterator end;
+	for (; it != end; it.increment(ec)) {
+		if (ec) break;
+		std::error_code ec_local;
+		CeDirEntry e;
+		e.name = it->path().filename().generic_string();
+		e.is_dir = it->is_directory(ec_local) ? 1 : 0;
+		sCeDirEntries.push_back(std::move(e));
+	}
+	std::sort(sCeDirEntries.begin(), sCeDirEntries.end(),
+		[](const CeDirEntry& a, const CeDirEntry& b) { return a.name < b.name; });
+	return (int)sCeDirEntries.size();
+}
+
+extern "C" int port_list_entry(int idx, char* name_out, int name_cap, int* is_dir) {
+	if (!name_out || idx < 0 || idx >= (int)sCeDirEntries.size()) {
+		return -1;
+	}
+	const CeDirEntry& e = sCeDirEntries[(size_t)idx];
+	if (name_cap <= (int)e.name.size()) {
+		return -1;
+	}
+	std::memcpy(name_out, e.name.c_str(), e.name.size());
+	name_out[e.name.size()] = '\0';
+	if (is_dir) {
+		*is_dir = e.is_dir;
+	}
+	return (int)e.name.size();
+}
+
+extern "C" long port_ce_read_mod_file(const char* abs_path, void* dst, long dst_cap) {
+	if (!abs_path) {
+		return -1;
+	}
+	std::error_code ec;
+	const std::filesystem::path p(abs_path);
+	const auto sz = std::filesystem::file_size(p, ec);
+	if (ec) {
+		return -1;
+	}
+	if (dst && dst_cap > 0) {
+		std::ifstream f(p, std::ios::binary);
+		if (!f) {
+			return -1;
+		}
+		const long n = (sz < (uintmax_t)dst_cap) ? (long)sz : dst_cap;
+		f.read((char*)dst, n);
+	}
+	return (long)sz;
+}
+
+/* The character mod registers this at MOD_INIT so the stock-icon read sites can
+ * map an extra abs_index costume to a real stock-LUT slot. Until then we pass
+ * through. */
+static int (*s_costume_stock_resolver)(int,int) = nullptr;
+
+extern "C" void port_register_costume_stock_resolver(int (*fn)(int,int)) {
+	s_costume_stock_resolver = fn;
+}
+
+extern "C" int port_fighter_costume_stock_index(int fkind, int costume) {
+	return s_costume_stock_resolver ? s_costume_stock_resolver(fkind, costume) : costume;
+}
 #endif
 
 // Port-side replacement for Ship::Context::LocateFileAcrossAppDirs.
@@ -1043,6 +1170,14 @@ static int PortInitImpl(int argc, char* argv[]) {
 	 * vanilla arrays, so synth fkinds never OOB those tables. */
 	port_fighter_seed_vanilla();
 	port_log("SSB64: fighter registry seeded\n");
+
+	/* Seed the per-gkind stage dispatch registry from the vanilla decomp
+	 * arrays (dMPCollisionGroundFileInfos / dGRMainSetupProcMakeList) at
+	 * startup. Synth stages registered past the vanilla GRKind range read
+	 * through these accessors instead of the fixed-size vanilla arrays, so
+	 * synth gkinds never OOB those tables. */
+	port_stage_seed_vanilla();
+	port_log("SSB64: stage registry seeded\n");
 
 #ifndef DISABLE_SCRIPTING
 	/* Mount mods/ entries (folders, .o2r, .zip) into the LUS

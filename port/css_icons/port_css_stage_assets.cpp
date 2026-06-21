@@ -27,7 +27,9 @@
  * These constants are derived from dStageLastBackground_0x26c88 (ROM-verified
  * in the old port_css_fd_background.h header comment).
  *
- * Adding a new stage: add one entry to STAGE_TABLE below.
+ * Stages live in a runtime registry: three built-in port stages are seeded
+ * from kBuiltinStages, and mods add/override more at MOD_INIT via
+ * portCSSRegisterStageAssets() (no rebuild). See the registry section below.
  */
 
 #ifdef PORT
@@ -49,6 +51,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 /* PR/sp.h uses _Static_assert (C11) and cannot be included from C++.
  * Opaque type tags. */
@@ -60,9 +63,14 @@ typedef struct bitmap Bitmap;
 namespace {
 
 // ---------------------------------------------------------------------------
-// Stage table.
+// Built-in port stages (seed data for the runtime registry below).
 //
-// To add a new port-introduced stage:
+// These three ship with the port and load their PNGs from assets/css_icons/
+// (extracted at build time by tools/derive_stage_assets.py). Mods add OR
+// override stages at runtime via portCSSRegisterStageAssets() — no rebuild;
+// see the registry section further down.
+//
+// To add another BUILT-IN port stage:
 //   1. Append a StageEntry here.
 //   2. Add a matching entry to STAGES in tools/derive_stage_assets.py.
 //   3. Add the CMake OUTPUT + DEPENDS + POST_BUILD copy for the new PNGs.
@@ -92,7 +100,7 @@ struct StageEntry {
     bool        has_emblem_png; // if false, portCSSGetStageEmblemSprite returns NULL
 };
 
-static constexpr StageEntry STAGE_TABLE[] = {
+static const StageEntry kBuiltinStages[] = {
     {
         /* nGRKindLast = 16 */
         16, "final_destination",
@@ -124,11 +132,15 @@ static constexpr StageEntry STAGE_TABLE[] = {
         true,  /* synthesized "BATTLEFIELD" nameplate */
         false, /* no emblem */
     },
+    // A custom stage is NOT baked here — it is a fully loose stage mod
+    // (the mod's folder) whose CSS art is registered at runtime by the stage mod
+    // via portCSSRegisterStageAssets (from stage_info.yaml + the loose PNGs). The
+    // FD/Metal/Battlefield rows above are ROM-derived port stages, not custom/loose.
     // { next_gkind, "next_name", bg_w, bg_h, bg_nbitmaps, bg_bm_h, bg_bm_hreal,
     //   bg_ndisplist, has_name_png, has_emblem_png },
 };
 
-static constexpr int kStageCount = (int)(sizeof(STAGE_TABLE) / sizeof(STAGE_TABLE[0]));
+static const int kBuiltinCount = (int)(sizeof(kBuiltinStages) / sizeof(kBuiltinStages[0]));
 
 // Icon dimensions — same for all stages (matches N64 CSS format).
 constexpr int      kIconW  = 48;
@@ -151,9 +163,59 @@ struct CacheEntry {
     int       nbitmaps   = 0;
 };
 
-// Flat 2D array: cache[gkind_index][asset_kind]
-static CacheEntry  sCache[kStageCount][kAssetKindCount];
-static std::mutex  sCacheMutex;
+// ---------------------------------------------------------------------------
+// Runtime stage-asset registry.
+//
+// Replaces the old fixed constexpr STAGE_TABLE + sCache[][] with a growable
+// registry so a mod can add (or override) a stage's CSS assets at MOD_INIT via
+// portCSSRegisterStageAssets() — no host rebuild. The built-in port stages are
+// seeded from kBuiltinStages on first use. Each row owns its filename stem and
+// an optional loose-asset base_dir (a mod points this at its own folder so its
+// converted PNGs load from mods/<Name>/ instead of assets/css_icons).
+// ---------------------------------------------------------------------------
+
+struct StageRow {
+    int         gkind;
+    std::string name;       // filename stem
+    std::string base_dir;   // PNG source dir (rel to app dir); empty => "assets/css_icons"
+    int         bg_w, bg_h, bg_nbitmaps, bg_bm_h, bg_bm_hreal, bg_ndisplist;
+    bool        has_name_png, has_emblem_png;
+    CacheEntry  cache[kAssetKindCount];
+};
+
+static std::vector<StageRow> sRegistry;
+static std::mutex            sCacheMutex;
+static bool                  sSeeded = false;
+
+// Seed the built-in port stages once. Caller must hold sCacheMutex.
+static void seedRegistry() {
+    if (sSeeded) return;
+    sSeeded = true;
+    for (int i = 0; i < kBuiltinCount; ++i) {
+        const StageEntry &b = kBuiltinStages[i];
+        StageRow r;
+        r.gkind        = b.gkind;
+        r.name         = b.name;
+        r.base_dir     = "";
+        r.bg_w         = b.bg_w;
+        r.bg_h         = b.bg_h;
+        r.bg_nbitmaps  = b.bg_nbitmaps;
+        r.bg_bm_h      = b.bg_bm_h;
+        r.bg_bm_hreal  = b.bg_bm_hreal;
+        r.bg_ndisplist = b.bg_ndisplist;
+        r.has_name_png   = b.has_name_png;
+        r.has_emblem_png = b.has_emblem_png;
+        sRegistry.push_back(std::move(r));
+    }
+}
+
+// Find a registry row by gkind. Caller must hold sCacheMutex.
+static StageRow *findRow(int gkind) {
+    for (StageRow &r : sRegistry) {
+        if (r.gkind == gkind) return &r;
+    }
+    return nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Sprite builder helpers.
@@ -577,7 +639,8 @@ static void reregisterEntry(const CacheEntry &e) {
 // Expected dimensions are validated; returns nullptr on mismatch/error.
 // ---------------------------------------------------------------------------
 
-static uint8_t *loadPNGAsRGBA16BE(const std::string &path, int expected_w, int expected_h) {
+static uint8_t *loadPNGAsRGBA16BE(const std::string &path, int expected_w, int expected_h,
+                                  int *out_w = nullptr, int *out_h = nullptr) {
     int w = 0, h = 0, channels = 0;
     uint8_t *rgba8 = stbi_load(path.c_str(), &w, &h, &channels, 4);
     if (!rgba8) {
@@ -587,7 +650,11 @@ static uint8_t *loadPNGAsRGBA16BE(const std::string &path, int expected_w, int e
         return nullptr;
     }
 
-    if (w != expected_w || h != expected_h) {
+    // expected_w/h <= 0 means "accept any size": a mod ships only a background PNG
+    // and the TMEM-slice geometry is computed from these actual dimensions. Fixed
+    // expected dims (ROM-derived builtins, the 48x36 icon, the 96x10 name) still
+    // validate.
+    if ((expected_w > 0 && w != expected_w) || (expected_h > 0 && h != expected_h)) {
         port_log("CSS stage assets: %s — expected %dx%d, got %dx%d; skipping.\n",
                  path.c_str(), expected_w, expected_h, w, h);
         stbi_image_free(rgba8);
@@ -597,6 +664,8 @@ static uint8_t *loadPNGAsRGBA16BE(const std::string &path, int expected_w, int e
     uint8_t *rgba16 = convertToRGBA16BE(rgba8, w, h);
     stbi_image_free(rgba8);
 
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
     if (!rgba16) {
         port_log("CSS stage assets: convertToRGBA16BE OOM for %s\n", path.c_str());
     }
@@ -634,19 +703,13 @@ static uint8_t *loadPNGAsIA4(const std::string &path, int expected_w, int expect
 // ---------------------------------------------------------------------------
 
 static Sprite *getSprite(int gkind, AssetKind asset_kind) {
-    // Find the stage table entry.
-    int stage_idx = -1;
-    for (int i = 0; i < kStageCount; ++i) {
-        if (STAGE_TABLE[i].gkind == gkind) {
-            stage_idx = i;
-            break;
-        }
-    }
-    if (stage_idx < 0) return nullptr;  // gkind not in table
-
     std::lock_guard<std::mutex> guard(sCacheMutex);
+    seedRegistry();
 
-    CacheEntry &entry = sCache[stage_idx][asset_kind];
+    StageRow *row = findRow(gkind);
+    if (!row) return nullptr;  // gkind not registered
+
+    CacheEntry &entry = row->cache[asset_kind];
 
     if (entry.sprite) {
         // Cache hit: re-register for scene-boundary safety.
@@ -654,8 +717,15 @@ static Sprite *getSprite(int gkind, AssetKind asset_kind) {
         return entry.sprite;
     }
 
-    // Cache miss: load the PNG.
-    const StageEntry &se = STAGE_TABLE[stage_idx];
+    // Cache miss: build a StageEntry view of this row for the build helpers.
+    // (row->name.c_str() is valid for this call: the mutex is held and no
+    // registration — the only thing that grows sRegistry — can run meanwhile.)
+    const StageEntry se = {
+        row->gkind, row->name.c_str(),
+        row->bg_w, row->bg_h, row->bg_nbitmaps,
+        row->bg_bm_h, row->bg_bm_hreal, row->bg_ndisplist,
+        row->has_name_png, row->has_emblem_png,
+    };
 
     // For nameplate sprites: return NULL immediately if this stage has no PNG.
     if (asset_kind == kName && !se.has_name_png) {
@@ -687,14 +757,20 @@ static Sprite *getSprite(int gkind, AssetKind asset_kind) {
         expected_h = kIconH;
     }
 
-    std::string rel_path = std::string("assets/css_icons/") + se.name + suffix;
+    // PNG source dir: the row's loose base_dir (a mod's own converted-asset
+    // folder) or the default build-extracted assets/css_icons.
+    const std::string dir = row->base_dir.empty()
+                                ? std::string("assets/css_icons/")
+                                : (row->base_dir + "/");
+    std::string rel_path = dir + se.name + suffix;
     std::string full_path = Ship::Context::GetPathRelativeToAppDirectory(rel_path.c_str());
 
     // Emblems use the ROM's IA4 single-bitmap format (alpha-mask source); all
     // other CSS sprites use RGBA16. Pick the converter accordingly.
+    int loaded_w = 0, loaded_h = 0;
     uint8_t *pixels = (asset_kind == kEmblem)
                           ? loadPNGAsIA4(full_path, expected_w, expected_h)
-                          : loadPNGAsRGBA16BE(full_path, expected_w, expected_h);
+                          : loadPNGAsRGBA16BE(full_path, expected_w, expected_h, &loaded_w, &loaded_h);
     if (!pixels) {
         // File missing or wrong size — return NULL so caller falls back to ROM sprite.
         return nullptr;
@@ -702,7 +778,21 @@ static Sprite *getSprite(int gkind, AssetKind asset_kind) {
 
     Sprite *sp = nullptr;
     if (asset_kind == kBackground) {
-        sp = buildBackgroundSprite(se, pixels, &entry);
+        // Compute the TMEM-slice geometry from the PNG's own dimensions, so a stage
+        // mod ships only a background PNG (no nbitmaps/bm_h/bm_hreal/ndisplist). The
+        // formula reproduces the ROM/builtin numbers exactly (300x220 -> 6/5/44/552):
+        //   bm_hreal = 4096 / (w*2)   (max RGBA16 rows in a 4KB TMEM tile)
+        //   bm_h     = bm_hreal - 1   (one fringe row)
+        //   nbitmaps = ceil(h / bm_h)
+        //   ndisplist= nbitmaps*12 + 24
+        StageEntry seb       = se;
+        seb.bg_w             = loaded_w;
+        seb.bg_h             = loaded_h;
+        seb.bg_bm_hreal      = 4096 / (loaded_w * 2);
+        seb.bg_bm_h          = seb.bg_bm_hreal - 1;
+        seb.bg_nbitmaps      = (loaded_h + seb.bg_bm_h - 1) / seb.bg_bm_h;
+        seb.bg_ndisplist     = seb.bg_nbitmaps * 12 + 24;
+        sp = buildBackgroundSprite(seb, pixels, &entry);
     } else if (asset_kind == kName) {
         sp = buildNameSprite(pixels, &entry);
     } else if (asset_kind == kEmblem) {
@@ -742,6 +832,43 @@ extern "C" Sprite *portCSSGetStageNameSprite(int gkind) {
 
 extern "C" Sprite *portCSSGetStageEmblemSprite(int gkind) {
     return getSprite(gkind, kEmblem);
+}
+
+extern "C" void portCSSRegisterStageAssets(const PortCSSStageAssetDesc *desc) {
+    if (desc == nullptr || desc->name == nullptr) return;
+
+    std::lock_guard<std::mutex> guard(sCacheMutex);
+    seedRegistry();
+
+    StageRow *existing = findRow(desc->gkind);
+    StageRow  fresh;
+    StageRow &r = existing ? *existing : fresh;
+
+    r.gkind        = desc->gkind;
+    r.name         = desc->name;
+    r.base_dir     = (desc->base_dir && desc->base_dir[0]) ? desc->base_dir : "";
+    r.bg_w         = desc->bg_w;
+    r.bg_h         = desc->bg_h;
+    r.bg_nbitmaps  = desc->bg_nbitmaps;
+    r.bg_bm_h      = desc->bg_bm_h;
+    r.bg_bm_hreal  = desc->bg_bm_hreal;
+    r.bg_ndisplist = desc->bg_ndisplist;
+    r.has_name_png   = desc->has_name_png != 0;
+    r.has_emblem_png = desc->has_emblem_png != 0;
+
+    if (existing) {
+        // Re-registration: drop cached sprites so the new assets reload. (At
+        // MOD_INIT the cache is empty; this only matters for a late re-register.)
+        for (int k = 0; k < kAssetKindCount; ++k) {
+            existing->cache[k] = CacheEntry{};
+        }
+    } else {
+        sRegistry.push_back(std::move(fresh));
+    }
+
+    port_log("CSS stage assets: registered gkind=%d name=%s base=%s\n",
+             desc->gkind, desc->name,
+             r.base_dir.empty() ? "(default)" : r.base_dir.c_str());
 }
 
 #endif /* PORT */

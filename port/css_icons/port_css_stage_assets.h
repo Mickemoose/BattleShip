@@ -109,6 +109,41 @@ Sprite *portCSSGetStageNameSprite(int gkind);
  */
 Sprite *portCSSGetStageEmblemSprite(int gkind);
 
+/**
+ * Runtime stage-asset registration — the runtime analog of appending a
+ * STAGE_TABLE entry, so a mod (e.g. the stage mod) can add OR override a
+ * stage's CSS preview assets at MOD_INIT with NO host rebuild.
+ *
+ * After registration the four getters above return this stage's sprites,
+ * loaded from PNGs at:
+ *   <app-data>/<base_dir>/<name>_{background,small,name,emblem}.png
+ * base_dir lets a mod point at its own folder (e.g. "mods/MyStage") so its
+ * converted/loose PNGs load directly; NULL or "" falls back to the
+ * build-extracted "assets/css_icons". Strings are copied.
+ *
+ * Thread-safe; intended for MOD_INIT (register before the CSS screen first
+ * renders). Re-registering a gkind replaces its descriptor and drops any
+ * cached sprites so the new assets reload.
+ *
+ * NOTE: this supplies the stage's CSS TEXTURES only. A brand-new gkind also
+ * needs a gameplay map file (port_stage_register) and a stage-select grid cell
+ * (the mnmaps page-layout path) before it is actually selectable.
+ */
+typedef struct PortCSSStageAssetDesc {
+    int         gkind;          /* GRKind value */
+    const char *name;           /* filename stem, e.g. "customstage" */
+    const char *base_dir;       /* PNG dir rel to app dir; NULL/"" => "assets/css_icons" */
+    int         bg_w, bg_h;     /* background full dimensions (pixels) */
+    int         bg_nbitmaps;    /* TMEM-slice bitmap count */
+    int         bg_bm_h;        /* rendered rows per bitmap */
+    int         bg_bm_hreal;    /* N64 bmHreal (TMEM-load rows incl. fringe) */
+    int         bg_ndisplist;   /* ndisplist from the sprite */
+    int         has_name_png;   /* nonzero if a <name>_name.png is shipped */
+    int         has_emblem_png; /* nonzero if a <name>_emblem.png is shipped */
+} PortCSSStageAssetDesc;
+
+void portCSSRegisterStageAssets(const PortCSSStageAssetDesc *desc);
+
 #ifdef __cplusplus
 }
 #endif

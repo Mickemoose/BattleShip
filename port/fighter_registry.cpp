@@ -151,7 +151,7 @@ void port_fighter_for_each(PortFighterForEachFn cb, void *user)
     }
 }
 
-/* SR engine-extension accessors. Each looks up the fkind row and falls
+/* Engine-extension accessors. Each looks up the fkind row and falls
  * back to a safe sentinel (0 / NULL / safe int) when no override is
  * registered. */
 
@@ -165,17 +165,16 @@ int port_fighter_shield_hitlag_skip(int fkind, struct GObj *fighter_gobj, int st
     return 0;
 }
 
-int port_fighter_ecb_override(int fkind, struct FTStruct *fp, int next_status_id,
+int port_fighter_ecb_override(struct FTStruct *fp, int next_status_id,
                                float *out_upper, float *out_middle)
 {
     if (fp == nullptr || out_upper == nullptr || out_middle == nullptr) return 0;
-    /* ECB resizing is per-fighter: only the descriptor registered for THIS
-     * fighter's fkind may rewrite its diamond. The old form looped over every
-     * registered fighter and called each one's callback with this fp, so a mod
-     * that hooked one character could resize unrelated/vanilla fighters. */
-    if (const auto *r = get(fkind)) {
-        if (r->ecb_override != nullptr) {
-            return r->ecb_override(fp, next_status_id, out_upper, out_middle);
+    for (size_t i = 0; i < sRegistry.size(); ++i) {
+        const FighterDescriptor *r = sRegistry[i].get();
+        if (r == nullptr) continue;
+        if (r->ecb_override == nullptr) continue;
+        if (r->ecb_override(fp, next_status_id, out_upper, out_middle)) {
+            return 1;
         }
     }
     return 0;
@@ -187,7 +186,7 @@ int port_fighter_kirby_hat_id(int fkind)
     return 0;
 }
 
-/* Per-player pending custom hat id storage lives in KirbyHatEngine. These
+/* Per-player pending custom hat id storage lives in the Kirby-copy mod. These
  * forward through handlers the mod installs at MOD_INIT. */
 static PortKirbySetPendingHatFn s_set_pending = nullptr;
 static PortKirbyGetPendingHatFn s_get_pending = nullptr;
@@ -221,6 +220,28 @@ void port_kirby_set_copy_special_fkind(int fkind)
 int port_kirby_get_copy_special_fkind(void)
 {
     return sKirbyCopySpecialFkind;
+}
+
+/* FGC engine hooks. The FightingGameEngine mod installs these at MOD_INIT; the
+ * decomp ftMainProcUpdateInterrupt sites call the forwarders every frame. NULL
+ * (mod absent / pre-init / post-exit) => no-op, so vanilla flow is unchanged. */
+static PortFgcHookFn s_fgc_proc_interrupt = nullptr;
+static PortFgcHookFn s_fgc_hitlag_end = nullptr;
+
+void port_fgc_register_handlers(PortFgcHookFn proc_interrupt, PortFgcHookFn hitlag_end)
+{
+    s_fgc_proc_interrupt = proc_interrupt;
+    s_fgc_hitlag_end = hitlag_end;
+}
+
+void port_fgc_proc_interrupt_hook(struct GObj *fighter_gobj)
+{
+    if (s_fgc_proc_interrupt != nullptr) s_fgc_proc_interrupt(fighter_gobj);
+}
+
+void port_fgc_hitlag_end_hook(struct GObj *fighter_gobj)
+{
+    if (s_fgc_hitlag_end != nullptr) s_fgc_hitlag_end(fighter_gobj);
 }
 
 int port_fighter_crowd_chant_fgm(int fkind)
@@ -315,6 +336,12 @@ int port_fighter_custom_capture_action(int fkind)
     return 0;
 }
 
+int port_fighter_is_cargo_grabber(int fkind)
+{
+    if (const auto *r = get(fkind)) return r->is_cargo_grabber;
+    return 0;
+}
+
 int port_fighter_custom_capture_dk_interrupt(int fkind, struct FTStruct *grabber_fp)
 {
     if (const auto *r = get(fkind)) {
@@ -355,11 +382,12 @@ float port_fighter_results_wins_lx(int fkind)
     return 0.0f;
 }
 
-/* CE-owned FTEmblemModels blob base, refreshed every scene reset. The emblem
+/* Mod-owned FTEmblemModels blob base, refreshed every scene reset. The emblem
  * model's internal Gfx/Vtx/texture pointer tokens are wiped + re-registered on
  * each lbRelocInitSetup, so the base buffer pointer is stable but the resolved
- * model is only valid after CE has reloaded for the current generation. CE
- * passes NULL here if the reload failed, which disables the emblem draw. */
+ * model is only valid after the character mod has reloaded for the current
+ * generation. The mod passes NULL here if the reload failed, which disables the
+ * emblem draw. */
 static void *s_results_emblem_base = nullptr;
 
 void port_set_results_emblem_base(void *base)

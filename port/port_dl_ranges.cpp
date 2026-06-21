@@ -54,10 +54,29 @@ struct HitCache {
 thread_local HitCache sHitCache;
 
 /* "Walked past" threshold: how far past a registered range do we still
- * recognise as runaway-from-that-range? One 64 KiB window comfortably
- * covers the gap to the next mmap'd allocation while staying tight
- * enough to fire on the actual walk-off cases. */
-constexpr size_t kWalkPastWindow = 0x10000;
+ * recognise as runaway-from-that-range?
+ *
+ * A genuine runaway is a DL that lacks a gsSPEndDisplayList and keeps
+ * consuming commands until the walker steps off the end of its own range.
+ * Because the walker advances by a fixed packed-command stride and every
+ * range is registered at its EXACT allocation size (lbreloc_bridge.cpp:665/885
+ * register copySize = the memcpy'd buffer size; taskman.c registers the whole
+ * scene heap), the FIRST command read past the end lands at offset 0 from
+ * range_end. So any window >= 1 catches the real walk-off on its first step.
+ *
+ * The old 0x10000 (64 KiB) window was far too wide for a PC heap: a perfectly
+ * valid SEPARATE DL buffer (a scene resource, a mod's malloc'd DL) routinely
+ * gets allocated within 64 KiB after a registered range, and an explicit G_DL
+ * CALL into it was then misclassified as "runaway from that range" -> gfx_step
+ * tore down the whole frame's walk -> textures/visuals blinked invisible.
+ *
+ * 0x40 (a few packed commands) keeps the real walk-off catch at offset 0 with a
+ * tiny margin against a hypothetical short-registered range, while letting a
+ * legit branch to a separate buffer (tens of KB out, or even tens of bytes)
+ * classify as UNKNOWN -> allowed -> drawn. Worst case of "too small" is a
+ * let-through, never a new crash; worst case of "too big" is the invisible-
+ * texture frame-kill we are removing. */
+constexpr size_t kWalkPastWindow = 0x40;
 
 } /* namespace */
 
